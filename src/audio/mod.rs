@@ -7,6 +7,12 @@ use pipewire::registry::GlobalObject;
 use pipewire::spa::pod::Object;
 use pipewire::spa::utils::dict::DictRef;
 use pipewire::types::ObjectType;
+use std::sync::mpsc;
+use std::sync::Arc;
+use std::sync::Mutex;
+
+use log::{info, debug, warn, error};
+
 
 
 
@@ -30,47 +36,30 @@ struct UserData {
 }
 
 
-pub fn audio_main() {
-    // set up all of the audio stuff we need
-    let mut ar = AudioReceiver::new();
-        
+struct CurrentStore {
+    channel_zero: f32,
+    channel_one: f32
+}
+
+pub fn audio_main(
+    data_sender: mpsc::Sender<(f32, f32)>,
+    requester: pipewire::channel::Receiver<()>
+) {
     // build our main loop to receive messages from pipewire
     pipewire::init();
     let mainloop = MainLoop::new(None).unwrap();
+    // whenever we get a request for data, send back dual channel f32LE data
+    let store = Arc::new(Mutex::new(CurrentStore{channel_zero: 0.0, channel_one: 0.0}));
+    let _receiver = requester.attach(mainloop.loop_(), {
+        let store = store.clone();
+        move |_| {
+            let store = store.lock().unwrap();
+            debug!("Audio receiver: Trying to send {} {}", store.channel_zero, store.channel_one);
+            data_sender.send((store.channel_zero, store.channel_one)).unwrap();
+        }
+    });
     let context: Context = Context::new(&mainloop).unwrap();
-    let core: Core = context.connect(None).unwrap();
-    let registry = core.get_registry().unwrap();    
-
-    let _listener = registry
-        .add_listener_local()
-        .global(|global|  {
-            if global.type_ == ObjectType::Port {
-                let props = global.props.as_ref().unwrap();
-                let port_name = props.get("port.name").unwrap();
-                if port_name == "monitor_FR" || port_name == "monitor_FL" {
-                    let port_alias = props.get("port.alias");
-                    let object_path = props.get("object.path");
-                    let format_dsp = props.get("format.dsp");
-                    let audio_channel = props.get("audio.channel");
-                    let port_id = props.get("port.id");
-                    let port_direction = props.get("port.direction");
-                    println!("Port: Name: {:?} Alias: {:?}  Id: {:?} Direction: {:?} AudioChannel: {:?} Object Path: {:?} FormatDsp: {:?}",
-                        port_name,
-                        port_alias,
-                        port_id,port_direction,audio_channel,object_path,format_dsp
-                    );
-                }
-            } else if global.type_ == ObjectType::Node {
-                let props = global.props.as_ref().unwrap();
-                println!("{:?}", props)
-            }
-        })
-    .register();
-
-    // create a new node and endpoints
-    // look here: https://gitlab.freedesktop.org/pipewire/pipewire-rs/-/blob/main/pipewire/examples/audio-capture.rs?ref_type=heads
-
-    
+    let core: Core = context.connect(None).unwrap();    
 
     let data = UserData {
         format: Default::default(),
@@ -88,16 +77,12 @@ pub fn audio_main() {
      * you need to listen to is the process event where you need to produce
      * the data.
      */
-    let mut props = pipewire::properties::properties! {
+    let props = pipewire::properties::properties! {
         *pipewire::keys::MEDIA_TYPE => "Audio",
         *pipewire::keys::MEDIA_CATEGORY => "Capture",
         *pipewire::keys::MEDIA_ROLE => "Music",
-    };
-
-    props.insert(*pipewire::keys::STREAM_CAPTURE_SINK, "true");
-
-    // uncomment if you want to capture from the sink monitor ports
-    // props.insert(*pw::keys::STREAM_CAPTURE_SINK, "true");
+        *pipewire::keys::STREAM_CAPTURE_SINK => "true"
+    }; 
 
     let stream = pipewire::stream::Stream::new(&core, "audio-capture", props).unwrap();
 
@@ -128,52 +113,45 @@ pub fn audio_main() {
                 .parse(param)
                 .expect("Failed to parse param changed to AudioInfoRaw");
 
-            println!(
+            info!(
                 "capturing rate:{} channels:{}",
                 user_data.format.rate(),
                 user_data.format.channels()
             );
         })
-        .process(|stream, user_data| match stream.dequeue_buffer() {
-            None => println!("out of buffers"),
+        .process(move |stream, user_data| match stream.dequeue_buffer() {
+            None => warn!("out of buffers"),
             Some(mut buffer) => {
+                // pull data out of buffer
                 let datas = buffer.datas_mut();
                 if datas.is_empty() {
                     return;
                 }
 
+                // looking only at the first chunk of data, parse # channels and samples
                 let data = &mut datas[0];
                 let n_channels = user_data.format.channels();
                 let n_samples = data.chunk().size() / (std::mem::size_of::<f32>() as u32);
-
+                
+                // make sure we have actually gotten data
                 if let Some(samples) = data.data() {
-                    if user_data.cursor_move {
-                        print!("\x1B[{}A", n_channels + 1);
-                    }
-                    println!("captured {} samples", n_samples / n_channels);
+                    // for each one of the received channels...
                     for c in 0..n_channels {
-                        let mut max: f32 = 0.0;
+                        // for each sample index for that channel...
                         for n in (c..n_samples).step_by(n_channels as usize) {
+                            // parse the f32 value for it
                             let start = n as usize * std::mem::size_of::<f32>();
                             let end = start + std::mem::size_of::<f32>();
                             let chan = &samples[start..end];
                             let f = f32::from_le_bytes(chan.try_into().unwrap());
-                            max = max.max(f.abs());
+                            let mut store = store.lock().unwrap();
+                            match c {
+                                0 => store.channel_zero = f,
+                                1 => store.channel_one = f,
+                                _ => debug!("Ignoring channel {c}")
+                            }
                         }
-
-                        let peak = ((max * 30.0) as usize).clamp(0, 39);
-
-                        println!(
-                            "channel {}: |{:>w1$}{:w2$}| peak:{}",
-                            c,
-                            "*",
-                            "",
-                            max,
-                            w1 = peak + 1,
-                            w2 = 40 - peak
-                        );
                     }
-                    user_data.cursor_move = true;
                 }
             }
         })
@@ -218,8 +196,11 @@ pub fn audio_main() {
 
 }
 
-pub fn spawn_audio_thread() -> JoinHandle<()> {
-    spawn(||{
-        audio_main();
+pub fn spawn_audio_thread(
+    data_sender: mpsc::Sender<(f32, f32)>,
+    requester: pipewire::channel::Receiver<()>
+) -> JoinHandle<()> {
+    spawn(move ||{
+        audio_main(data_sender, requester);
     })
 }
