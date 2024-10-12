@@ -37,24 +37,24 @@ struct UserData {
 
 
 struct CurrentStore {
-    channel_zero: f32,
-    channel_one: f32
+    channel_zero: [f32; 512],
+    channel_one: [f32; 512]
 }
 
 pub fn audio_main(
-    data_sender: mpsc::Sender<(f32, f32)>,
+    data_sender: mpsc::Sender<([f32; 512], [f32; 512])>,
     requester: pipewire::channel::Receiver<()>
 ) {
     // build our main loop to receive messages from pipewire
     pipewire::init();
     let mainloop = MainLoop::new(None).unwrap();
     // whenever we get a request for data, send back dual channel f32LE data
-    let store = Arc::new(Mutex::new(CurrentStore{channel_zero: 0.0, channel_one: 0.0}));
+    let store = Arc::new(Mutex::new(CurrentStore{channel_zero: [0.0; 512], channel_one: [0.0; 512]}));
     let _receiver = requester.attach(mainloop.loop_(), {
         let store = store.clone();
         move |_| {
             let store = store.lock().unwrap();
-            debug!("Audio receiver: Trying to send {} {}", store.channel_zero, store.channel_one);
+            debug!("Audio receiver: Trying to send {:?} {:?}", store.channel_zero, store.channel_one);
             data_sender.send((store.channel_zero, store.channel_one)).unwrap();
         }
     });
@@ -132,6 +132,11 @@ pub fn audio_main(
                 let data = &mut datas[0];
                 let n_channels = user_data.format.channels();
                 let n_samples = data.chunk().size() / (std::mem::size_of::<f32>() as u32);
+
+                // don't update stuff if we don't have enough samples
+                if n_samples < 512 {
+                    return;
+                }
                 
                 // make sure we have actually gotten data
                 if let Some(samples) = data.data() {
@@ -145,10 +150,12 @@ pub fn audio_main(
                             let chan = &samples[start..end];
                             let f = f32::from_le_bytes(chan.try_into().unwrap());
                             let mut store = store.lock().unwrap();
-                            match c {
-                                0 => store.channel_zero = f,
-                                1 => store.channel_one = f,
-                                _ => debug!("Ignoring channel {c}")
+                            if n < 512 * 2 {
+                                match c {
+                                    0 => store.channel_zero[n as usize/2] = f,
+                                    1 => store.channel_one[(n as usize - 1)/2] = f,
+                                    _ => debug!("Ignoring channel {c}")
+                                }
                             }
                         }
                     }
@@ -197,7 +204,7 @@ pub fn audio_main(
 }
 
 pub fn spawn_audio_thread(
-    data_sender: mpsc::Sender<(f32, f32)>,
+    data_sender: mpsc::Sender<([f32; 512], [f32; 512])>,
     requester: pipewire::channel::Receiver<()>
 ) -> JoinHandle<()> {
     spawn(move ||{

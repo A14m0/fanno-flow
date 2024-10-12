@@ -3,6 +3,7 @@ mod audio;
 
 use std::sync::mpsc;
 use pipewire::channel::Receiver;
+use realfft::RealFftPlanner;
 
 use std::io::{stdin,stdout,Write};
 use log::info;
@@ -29,9 +30,32 @@ fn main() {
         request_sender.send(()).unwrap();
         
         // wait for the data to be received
-        let out = data_receiver.recv();
+        let out = data_receiver.recv().unwrap();
 
         info!("Received: {:?}", out);
+
+        // try to build an FFT planner
+        let mut real_planner = RealFftPlanner::<f32>::new();
+
+        // build the FFT
+        let r2c = real_planner.plan_fft_forward(512);
+        let mut indat = r2c.make_input_vec();
+        for v in 0..512 {
+            indat[v] = out.0[v];
+        }
+        let mut spectrum = r2c.make_output_vec();
+
+        // forward transform
+        r2c.process(&mut indat, &mut spectrum).unwrap();
+
+        // create inverse FFT
+        let c2r = real_planner.plan_fft_inverse(512);
+        let mut outdata = c2r.make_output_vec();
+        c2r.process(&mut spectrum, &mut outdata).unwrap();
+
+        info!("Input data: {:?}", indat);
+        info!("Forward FFT: {:?}", spectrum);
+        info!("Reverse FFT output: {:?}", outdata);
 
     }
 }
